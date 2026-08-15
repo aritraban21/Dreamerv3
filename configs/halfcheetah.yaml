@@ -1,0 +1,28 @@
+# Part 2 — HalfCheetah-v4 (full benchmark)
+# obs_dim=17, action_dim=6, continuous, dense reward
+# Expected: reward ~4000-6000 within 1M steps with full paper hyperparameters
+# Requires: pip install gymnasium[mujoco] mujoco
+
+env: HalfCheetah-v4
+seed: 0
+device: cuda             # GPU strongly recommended for Part 2
+total_steps: 1000000
+eval_every: 20000
+eval_episodes: 5
+save_path: checkpoints/halfcheetah.pt
+log_every: 1000
+
+# Full paper model size
+embed_dim: 1024
+deter_dim: 4096
+stoch_dim: 32
+stoch_classes: 32
+hidden_dim: 1024
+num_layers: 2
+
+# Part 2: switch to LaProp + AGC optimizer
+# Uncomment in agent.py and optim.py after implementing LaProp
+# optimizer: laprop
+# laprop_betas: [0.9, 0.999]
+# laprop_epsilon: 1.0e-20   # paper Table 4 (NOT Adam's 1e-8)
+# agc_lambda: 0.3

@@ -1,0 +1,23 @@
+# Part 1 — Pendulum-v1 (sanity test)
+# Fast environment: obs_dim=3, action_dim=1, continuous, bounded rewards [-16, 0]
+# Expected: reward improves from ~-1400 (random) to ~-150 within 100K steps
+
+env: Pendulum-v1
+seed: 0
+device: cpu              # Pendulum is tiny; CPU is fine for Part 1
+total_steps: 200000
+eval_every: 5000
+eval_episodes: 5
+save_path: checkpoints/pendulum.pt
+log_every: 25
+
+# Smaller model for faster iteration in Part 1
+embed_dim: 256
+deter_dim: 512
+stoch_dim: 16
+stoch_classes: 16
+hidden_dim: 256
+num_layers: 2
+
+# Keep all other hyperparameters at their default values
+# (inherit from default.yaml by loading default first, then overriding)

@@ -1,0 +1,74 @@
+# DreamerV3 hyperparameters — fixed across all environments (no domain-specific tuning)
+
+env: Pendulum-v1
+seed: 0
+device: cuda  # or cpu
+total_steps: 500000
+eval_every: 10000
+eval_episodes: 5
+save_path: checkpoints/dreamer.pt
+log_every: 25
+
+# Replay buffer
+replay_capacity: 5000000   # paper Table 4: 5e6. Memory-heavy; 1e6 is fine for Pendulum/state-based obs.
+prefill_steps: 1000        # random steps before first gradient update
+
+# Batching
+batch_size: 16             # number of sequences per gradient step
+batch_length: 64           # timesteps per sequence (T)
+train_ratio: 512           # DreamerV3 paper convention (Table 4): number of REPLAY observations
+                           # seen per ENV observation. Grad steps per env step =
+                           # train_ratio / (batch_size * batch_length). e.g. 512 / 1024 = 0.5
+                           # → 1 gradient update every 2 env steps. train.py handles the
+                           # fractional case via a `train_debt` accumulator.
+
+# Model architecture
+embed_dim: 1024            # encoder output dim
+deter_dim: 4096            # GRU hidden state size (deterministic h_t)
+stoch_dim: 32              # number of categorical latent variables
+stoch_classes: 32          # classes per variable (z_t is 32x32 = 1024 bits)
+hidden_dim: 1024           # MLP hidden layer width
+num_layers: 2              # hidden layers in MLPs (excl. input/output projections)
+num_bins: 255              # bins for TwoHot reward/value distributions
+bin_range: 20.0            # symlog-space bin range: covers symexp([-20, 20])
+unimix: 0.01               # uniform mixture fraction for categorical distributions
+
+# World model losses (DreamerV3 Eq. 4-5: fixed weights + free bits, no KL balancing)
+lambda_pred: 1.0           # prediction loss weight (recon + reward + continue), beta_pred
+lambda_dyn: 1.0            # dynamics KL weight (trains prior), beta_dyn — applied to max(free_bits, KL)
+                           #   paper (Eq. 2 & Table 4) uses beta_dyn = 1.0. NOTE: the official
+                           #   DreamerV3 GitHub code uses 0.5 — a known paper-vs-code discrepancy.
+                           #   Set to 0.5 if you want to match the reference implementation instead.
+lambda_rep: 0.1            # representation KL weight (trains encoder), beta_rep — applied to max(free_bits, KL)
+free_bits: 1.0             # minimum KL in nats, clipped per-term (prevents posterior collapse)
+
+# Actor-critic
+discount: 0.997            # gamma (equivalent to horizon ~333 steps)
+lambda_return: 0.95        # TD(lambda) mixing coefficient
+imagination_horizon: 16    # H — imagined trajectory length. NOTE: the paper is internally
+                           #   inconsistent — Table 4 lists H=15 but the main text (§Critic learning)
+                           #   says T=16. Kept at 16 (matches the text); 15 is equally defensible.
+actor_entropy: 0.0003      # eta — fixed entropy bonus coefficient
+actor_min_std: 0.1         # minimum action std (prevents deterministic collapse)
+critic_ema_decay: 0.98     # EMA decay for target critic network
+critic_repval_scale: 0.3   # critic replay regularization weight
+critic_slowreg: 1          # slow regularization weight for critic (prevents overfitting to imagined rollouts)
+
+# Return normalization
+ret_norm_decay: 0.99       # EMA decay for percentile statistics
+ret_norm_lower_pct: 5.0    # lower percentile for inter-percentile range
+ret_norm_upper_pct: 95.0   # upper percentile
+ret_norm_min: 1.0          # minimum denominator (prevents amplifying near-zero returns)
+
+# Optimization — Part 1 (Adam + global clip)
+lr: 4.0e-5                 # paper Table 4: 4e-5 (used for WM, actor, and critic). NOTE: many
+                           #   reimplementations use ~1e-4 for faster convergence on small tasks;
+                           #   for Pendulum you may raise this to 1e-4 if learning is slow.
+grad_clip: 100.0           # global gradient norm clip (Part 1 Adam; Part 2 uses AGC instead)
+
+# Optimization — Part 2 (uncomment and set optimizer: laprop)
+# optimizer: laprop
+# laprop_betas: [0.9, 0.999]
+# laprop_epsilon: 1.0e-20  # paper Table 4: LaProp(eps = 1e-20). This unusually small eps is
+#                          #   characteristic of LaProp — do NOT use Adam's 1e-8 here.
+# agc_lambda: 0.3
