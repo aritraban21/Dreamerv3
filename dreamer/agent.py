@@ -36,7 +36,6 @@ from dreamer.models.critic import Critic
 from dreamer.utils.normalizer import ReturnNormalizer
 from dreamer.utils.math_utils import lambda_return, symlog
 from dreamer.replay_buffer import ReplayBuffer
-from dreamer.utils import probes
 
 
 class DreamerV3(nn.Module):
@@ -188,16 +187,8 @@ class DreamerV3(nn.Module):
         Returns:
             dict of scalar metrics: wm losses, actor loss, critic loss, return stats
         """
-        # advance probe step counter (once per train_step)
-        if not hasattr(self, "_probe_step"): self._probe_step = 0
-        self._probe_step += 1
-        probes.set_step(self._probe_step)
         # sample a batch: batch = replay_buffer.sample(config['batch_size'])
         batch = replay_buffer.sample(self.config['batch_size'])
-        # PROBES: batch stats
-        probes.probe("batch_obs", batch['obs'])
-        probes.probe("batch_reward", batch['reward'])
-        probes.probe("batch_action", batch['action'])
         # update world model: OP-01 wm-specific clip
         info, features = self.world_model.update(batch, self.wm_optimizer, self.device, self.wm_grad_clip)
         # generate imagined rollout from random subset of features:
@@ -318,16 +309,12 @@ class DreamerV3(nn.Module):
         # target: (B, H-1) — has grad through rewards -> actions -> actor (dynamics path)
         # weights: (B, H) detached
         # base: (B, H-1) detached
-        probes.probe("lambda_returns", target)
-        probes.probe("critic_values", values_full)
 
         # --- return-normalized advantage (matches ref RewardEMA) ---
         # Update normalizer on target (as ref does, on the target tensor pre-detach doesn't matter — RN uses percentiles).
         self.return_normalizer.update(target.detach())
         scale = self.return_normalizer.scale
         adv = (target - base) / scale        # base is detached; target keeps grad
-        probes.probe("advantages", adv)
-        probes.probe("return_scale", float(scale))
 
         # --- actor loss ---
         imag_gradient = self.config.get('imag_gradient', 'dynamics')
@@ -349,8 +336,6 @@ class DreamerV3(nn.Module):
         eta = self.config['actor_entropy']
         # Entropy sliced to H-1 to match (ref: entropy[:-1]).
         actor_loss = -(w * (actor_target + eta * entropy[:, :-1])).mean()
-        probes.probe("entropy", entropy)
-        probes.probe("actor_loss", actor_loss)
 
         # --- critic update ---
         # Critic uses detached features for first H-1 states (ref: value_input[:-1].detach()).
@@ -365,31 +350,17 @@ class DreamerV3(nn.Module):
         critic_loss_per = critic_loss_per + self.config['critic_slowreg'] * critic_reg_per
         # CR-06: weighted by cumulative discount (ref: torch.mean(weights[:-1] * value_loss)).
         critic_loss = (w * critic_loss_per).mean()
-        probes.probe("critic_loss", critic_loss)
-
-        # PROBE: canonical actor mean for PointMass
-        if self.obs_dim == 1:
-            with torch.no_grad():
-                canon_xs = torch.tensor([[-0.5], [0.0], [+0.5]], dtype=torch.float32, device=features.device)
-                s0 = self.world_model.rssm.initial_state(3)
-                pa = torch.zeros(3, self.action_dim, device=features.device)
-                emb = self.world_model.encode(canon_xs)
-                ns, _ = self.world_model.rssm.observe(emb, pa, s0)
-                cfeat = self.world_model.rssm.get_state_feature(ns)
-                cmean = self.actor(cfeat).mean.squeeze(-1)
-            probes.probe("canon_actor_mean", cmean)
 
         # --- backward. Critic loss uses detached features/target, so its graph is disjoint from actor's. ---
         self.actor_optimizer.zero_grad()
         actor_loss.backward()
-        actor_gn = torch.nn.utils.clip_grad_norm_(self.actor.parameters(), self.actor_grad_clip)
+        torch.nn.utils.clip_grad_norm_(self.actor.parameters(), self.actor_grad_clip)
         self.actor_optimizer.step()
 
         self.critic_optimizer.zero_grad()
         critic_loss.backward()
         torch.nn.utils.clip_grad_norm_(self.critic.parameters(), self.critic_grad_clip)
         self.critic_optimizer.step()
-        probes.probe("actor_grad_norm", actor_gn)
 
         info = {
             'actor_loss': actor_loss.item(),

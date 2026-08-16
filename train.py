@@ -27,7 +27,6 @@ import gymnasium as gym
 
 from dreamer.agent import DreamerV3
 from dreamer.replay_buffer import ReplayBuffer
-from dreamer.utils import probes
 import dreamer.envs  # noqa: F401  (side-effect: registers custom envs like PointMass1D-v0)
 
 
@@ -193,12 +192,6 @@ def train(config: dict) -> None:
     torch.manual_seed(seed)
     np.random.seed(seed)
     device = torch.device(config.get('device', 'cpu'))
-
-    # PROBES: enable if PROBE_FILE env var is set
-    _probe_file = os.environ.get("PROBE_FILE")
-    if _probe_file:
-        probes.set_probe_file(_probe_file)
-        print(f"[probes] writing to {_probe_file}", flush=True)
 
     grad_per_env = config['train_ratio'] / (config['batch_size'] * config['batch_length'])
     print(f"[startup] env={config['env']}  device={device}  seed={seed}", flush=True)
