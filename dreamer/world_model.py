@@ -30,6 +30,7 @@ from dreamer.models.rssm import RSSM
 from dreamer.models.predictors import RewardPredictor, ContinuePredictor
 from dreamer.utils.distributions import UnimixCategorical
 from dreamer.utils.math_utils import symlog
+from dreamer.utils import probes
 
 
 class WorldModel(nn.Module):
@@ -234,6 +235,14 @@ class WorldModel(nn.Module):
         # --- total ---
         # total_loss = self.lambda_pred * pred_loss + kl_loss
         total_loss = self.lambda_pred * pred_loss + kl_loss
+        # PROBES: world-model loss components
+        probes.probe("wm_state_loss", recon_loss)  # match ref's wm_state_loss naming
+        probes.probe("wm_reward_loss", reward_loss)
+        probes.probe("wm_cont_loss", cont_loss)
+        probes.probe("wm_kl_loss", kl_loss)
+        probes.probe("wm_total_loss", total_loss)
+        probes.probe("wm_features_stats", features)
+        probes.probe("wm_reward_pred_mean", reward_dist.mean())
         # compile info dict for logging (all .item() scalars)
         # return total_loss, info
         info = {
@@ -288,7 +297,6 @@ class WorldModel(nn.Module):
         # return info, features
         return info, features
 
-    @torch.no_grad()
     def imagine_rollout(
         self,
         start_features: torch.Tensor,
@@ -323,18 +331,22 @@ class WorldModel(nn.Module):
         z = z_flat.reshape(z_flat.shape[0], self.config['stoch_dim'], self.config['stoch_classes'])
         # initial_state = {'h': h, 'z': z}
         initial_state = {'h': h, 'z': z}
-        # use torch.enable_grad() context and call self.rssm.imagine_sequence(initial_state, actor, horizon)
-        with torch.enable_grad():
-            imagination = self.rssm.imagine_sequence(initial_state, actor, horizon)
-    
+        # AC-01: keep gradients flowing so rewards/continues carry actor grad for dynamics-gradient path.
+        imagination = self.rssm.imagine_sequence(initial_state, actor, horizon)
+
         # extract features and actions from the returned dict
         imagined_features = imagination['features']
         imagined_actions = imagination['actions']
-        # compute imagined rewards: rewards = self.reward_pred(features).mean()  shape (B, H)
+        # imagined rewards: reward_pred features carry actor grad (dynamics gradient)
         imagined_rewards = self.reward_pred(imagined_features).mean()
-        # compute imagined continues: continues = self.cont_pred(features).probs  shape (B, H)
+        # imagined continues: same
         imagined_continues = self.cont_pred(imagined_features).probs
         # return {'features': features, 'actions': actions, 'rewards': rewards, 'continues': continues}
+        # PROBES: imagined rollout
+        probes.probe("imag_features_stats", imagined_features)
+        probes.probe("imag_actions_stats", imagined_actions)
+        probes.probe("imag_rewards_stats", imagined_rewards)
+        probes.probe("imag_continues_stats", imagined_continues)
         return {
             'features': imagined_features,
             'actions': imagined_actions,

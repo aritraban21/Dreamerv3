@@ -44,16 +44,19 @@ class MLPEncoder(nn.Module):
             Structure: Linear(obs_dim→hidden_dim) → [RMSNorm→SiLU→Linear(hidden→hidden)] x num_layers → Linear(hidden→embed_dim)
         """
         super().__init__()
-        # build input projection: nn.Linear(obs_dim, hidden_dim, bias=False)
-        self.input = nn.Linear(obs_dim, hidden_dim, bias=False)
+        # build input projection: bias=True is CRITICAL for low-dim obs — without it, the
+        # subsequent RMSNorm strips magnitude from scalar/low-dim inputs (output = x*W;
+        # RMSNorm(x*W) = sign(x)*W/RMS(W), losing |x|). Bias adds a constant term that
+        # RMSNorm cannot cancel, preserving magnitude info.
+        self.input = nn.Linear(obs_dim, hidden_dim, bias=True)
         self.hidden = nn.ModuleList()
         # build hidden layers as nn.ModuleList:
         for layer in range(num_layers):
-            self.hidden.append(nn.RMSNorm(hidden_dim))
+            self.hidden.append(nn.LayerNorm(hidden_dim, eps=1e-3))
             self.hidden.append(nn.SiLU())
             self.hidden.append(nn.Linear(hidden_dim, hidden_dim, bias=False))
         
-        #   each block is: nn.RMSNorm(hidden_dim), nn.SiLU(), nn.Linear(hidden_dim, hidden_dim, bias=False)
+        #   each block is: nn.LayerNorm(hidden_dim, eps=1e-3), nn.SiLU(), nn.Linear(hidden_dim, hidden_dim, bias=False)
         
         # build output projection: nn.Linear(hidden_dim, embed_dim, bias=False)
         self.output = nn.Linear(hidden_dim, embed_dim, bias=False)

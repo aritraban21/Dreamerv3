@@ -46,9 +46,9 @@ class RewardPredictor(nn.Module):
         """
         super().__init__()
         # build MLP: Linear(state_dim, hidden_dim) → [RMSNorm→SiLU→Linear(hidden, hidden)] x num_layers → Linear(hidden, num_bins)
-        layers = [nn.Linear(state_dim, hidden_dim, bias=False)]
+        layers = [nn.Linear(state_dim, hidden_dim, bias=True)]
         for _ in range(num_layers):
-            layers.append(nn.RMSNorm(hidden_dim))
+            layers.append(nn.LayerNorm(hidden_dim, eps=1e-3))
             layers.append(nn.SiLU())
             layers.append(nn.Linear(hidden_dim, hidden_dim, bias=False))
         layers.append(nn.Linear(hidden_dim, num_bins))
@@ -103,9 +103,9 @@ class ContinuePredictor(nn.Module):
         """
         super().__init__()
         # build MLP: Linear(state_dim, hidden_dim) → [RMSNorm→SiLU→Linear] x num_layers → Linear(hidden, 1)
-        layers = [nn.Linear(state_dim, hidden_dim, bias=False)]
+        layers = [nn.Linear(state_dim, hidden_dim, bias=True)]
         for _ in range(num_layers):
-            layers.append(nn.RMSNorm(hidden_dim))
+            layers.append(nn.LayerNorm(hidden_dim, eps=1e-3))
             layers.append(nn.SiLU())
             layers.append(nn.Linear(hidden_dim, hidden_dim, bias=False))
         layers.append(nn.Linear(hidden_dim, 1))

@@ -35,14 +35,12 @@ unimix: 0.01               # uniform mixture fraction for categorical distributi
 
 # World model losses (DreamerV3 Eq. 4-5: fixed weights + free bits, no KL balancing)
 lambda_pred: 1.0           # prediction loss weight (recon + reward + continue), beta_pred
-lambda_dyn: 1.0            # dynamics KL weight (trains prior), beta_dyn — applied to max(free_bits, KL)
-                           #   paper (Eq. 2 & Table 4) uses beta_dyn = 1.0. NOTE: the official
-                           #   DreamerV3 GitHub code uses 0.5 — a known paper-vs-code discrepancy.
-                           #   Set to 0.5 if you want to match the reference implementation instead.
+lambda_dyn: 0.5            # dynamics KL weight (trains prior). WM-01: aligned with reference (dyn_scale=0.5).
 lambda_rep: 0.1            # representation KL weight (trains encoder), beta_rep — applied to max(free_bits, KL)
 free_bits: 1.0             # minimum KL in nats, clipped per-term (prevents posterior collapse)
 
 # Actor-critic
+imag_gradient: dynamics    # AC-01: 'dynamics' (analytic, matches ref default) or 'reinforce' (score-function)
 discount: 0.997            # gamma (equivalent to horizon ~333 steps)
 lambda_return: 0.95        # TD(lambda) mixing coefficient
 imagination_horizon: 16    # H — imagined trajectory length. NOTE: the paper is internally
@@ -50,6 +48,7 @@ imagination_horizon: 16    # H — imagined trajectory length. NOTE: the paper i
                            #   says T=16. Kept at 16 (matches the text); 15 is equally defensible.
 actor_entropy: 0.0003      # eta — fixed entropy bonus coefficient
 actor_min_std: 0.1         # minimum action std (prevents deterministic collapse)
+actor_max_std: 1.0         # maximum action std (prevents unbounded exploration blow-up)
 critic_ema_decay: 0.98     # EMA decay for target critic network
 critic_repval_scale: 0.3   # critic replay regularization weight
 critic_slowreg: 1          # slow regularization weight for critic (prevents overfitting to imagined rollouts)
@@ -60,11 +59,21 @@ ret_norm_lower_pct: 5.0    # lower percentile for inter-percentile range
 ret_norm_upper_pct: 95.0   # upper percentile
 ret_norm_min: 1.0          # minimum denominator (prevents amplifying near-zero returns)
 
-# Optimization — Part 1 (Adam + global clip)
-lr: 4.0e-5                 # paper Table 4: 4e-5 (used for WM, actor, and critic). NOTE: many
-                           #   reimplementations use ~1e-4 for faster convergence on small tasks;
-                           #   for Pendulum you may raise this to 1e-4 if learning is slow.
-grad_clip: 100.0           # global gradient norm clip (Part 1 Adam; Part 2 uses AGC instead)
+# Optimization — Part 1 (Adam + global clip). OP-01: per-network lr/eps/clip matching reference.
+lr: 4.0e-5                 # (legacy fallback; per-net lr below is authoritative)
+wm_lr: 1.0e-4              # ref model_lr
+actor_lr: 3.0e-5           # ref actor.lr (3x smaller than WM)
+critic_lr: 3.0e-5          # ref critic.lr
+wm_eps: 1.0e-8             # ref opt_eps
+actor_eps: 1.0e-5          # ref actor.eps
+critic_eps: 1.0e-5         # ref critic.eps
+wm_grad_clip: 1000.0       # ref model_grad_clip (10x bigger than actor/critic)
+actor_grad_clip: 100.0
+critic_grad_clip: 100.0
+grad_clip: 100.0           # legacy uniform clip (unused after OP-01)
+
+# Pretrain phase (LP-01)
+pretrain: 100              # ref pretrain: WM update steps on prefill data before env interaction
 
 # Optimization — Part 2 (uncomment and set optimizer: laprop)
 # optimizer: laprop

@@ -37,12 +37,16 @@ def critic(state_dim):
 # ─────────────────────────────────────────────
 
 def test_actor_forward_returns_dist(actor, state_dim):
-    """actor.forward() returns a TruncatedNormal distribution."""
-    from dreamer.utils.distributions import TruncatedNormal
+    """actor.forward() returns Independent(Normal(tanh(mean), std), 1)."""
     feature = torch.randn(8, state_dim)
     dist = actor(feature)
-    assert isinstance(dist, TruncatedNormal), \
-        f"Actor must return TruncatedNormal, got {type(dist)}"
+    assert isinstance(dist, torch.distributions.Independent), \
+        f"Actor must return Independent(Normal,1), got {type(dist)}"
+    assert isinstance(dist.base_dist, torch.distributions.Normal), \
+        f"Actor base_dist must be Normal, got {type(dist.base_dist)}"
+    # mean is tanh-bounded to (-1, 1)
+    assert (dist.mean.abs() <= 1.0).all(), \
+        f"Actor mean must be in [-1,1] (tanh-bounded), got range [{dist.mean.min()}, {dist.mean.max()}]"
 
 
 def test_actor_get_action_shape_training(actor, state_dim, action_dim):
@@ -59,12 +63,15 @@ def test_actor_get_action_shape_eval(actor, state_dim, action_dim):
     assert action.shape == (8, action_dim)
 
 
-def test_actor_samples_in_bounds(actor, state_dim):
-    """Sampled actions must be in [-1, 1]."""
+def test_actor_samples_within_reasonable_range(actor, state_dim):
+    """Sampled actions cluster near [-1, 1]. Actor uses unbounded Normal(tanh(mean), std) —
+    samples may exceed [-1, 1] slightly (env clips), but shouldn't run wild."""
     feature = torch.randn(64, state_dim)
     action = actor.get_action(feature, training=True)
-    assert (action >= -1.0 - 1e-5).all() and (action <= 1.0 + 1e-5).all(), \
-        f"Actions outside [-1, 1]. Min: {action.min().item()}, Max: {action.max().item()}"
+    # allow modest overshoot (~3 std beyond mean's tanh bound)
+    assert (action >= -3.0).all() and (action <= 3.0).all(), \
+        f"Actions unreasonably far from [-1, 1]. Min: {action.min().item()}, Max: {action.max().item()}"
+    assert torch.isfinite(action).all(), "actions must be finite"
 
 
 def test_actor_mean_in_bounds(actor, state_dim):

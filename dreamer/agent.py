@@ -36,6 +36,7 @@ from dreamer.models.critic import Critic
 from dreamer.utils.normalizer import ReturnNormalizer
 from dreamer.utils.math_utils import lambda_return, symlog
 from dreamer.replay_buffer import ReplayBuffer
+from dreamer.utils import probes
 
 
 class DreamerV3(nn.Module):
@@ -67,7 +68,8 @@ class DreamerV3(nn.Module):
                            action_dim=self.action_dim,
                            hidden_dim=config['hidden_dim'],
                            num_layers=config['num_layers'],
-                           min_std=config['actor_min_std'])
+                           min_std=config['actor_min_std'],
+                           max_std=config.get('actor_max_std', 1.0))
         # build self.critic: Critic(state_dim, hidden_dim, num_layers, num_bins, bin_range, ema_decay)
         self.critic = Critic(state_dim=self.state_dim,
                              hidden_dim=config['hidden_dim'],
@@ -80,12 +82,20 @@ class DreamerV3(nn.Module):
                                                   lower_pct=config['ret_norm_lower_pct'],
                                                   upper_pct=config['ret_norm_upper_pct'],
                                                   min_scale=config['ret_norm_min'])
-        # build self.wm_optimizer:     torch.optim.Adam(world_model.parameters(), lr=config['lr'])
-        self.wm_optimizer = torch.optim.Adam(self.world_model.parameters(), lr=config['lr'])
-        # build self.actor_optimizer:  torch.optim.Adam(actor.parameters(), lr=config['lr'])
-        self.actor_optimizer = torch.optim.Adam(self.actor.parameters(), lr=config['lr'])
-        # build self.critic_optimizer: torch.optim.Adam(critic.parameters(), lr=config['lr'])
-        self.critic_optimizer = torch.optim.Adam(self.critic.parameters(), lr=config['lr'])
+        # OP-01: per-network optimizers with reference lr/eps.
+        self.wm_optimizer = torch.optim.Adam(self.world_model.parameters(),
+                                             lr=config.get('wm_lr', config['lr']),
+                                             eps=config.get('wm_eps', 1e-8))
+        self.actor_optimizer = torch.optim.Adam(self.actor.parameters(),
+                                                lr=config.get('actor_lr', config['lr']),
+                                                eps=config.get('actor_eps', 1e-8))
+        self.critic_optimizer = torch.optim.Adam(self.critic.parameters(),
+                                                 lr=config.get('critic_lr', config['lr']),
+                                                 eps=config.get('critic_eps', 1e-8))
+        # OP-01: per-network grad clips
+        self.wm_grad_clip = config.get('wm_grad_clip', config.get('grad_clip', 100.0))
+        self.actor_grad_clip = config.get('actor_grad_clip', config.get('grad_clip', 100.0))
+        self.critic_grad_clip = config.get('critic_grad_clip', config.get('grad_clip', 100.0))
         # store device from config
         self.device = torch.device(config['device'])
 
@@ -178,10 +188,18 @@ class DreamerV3(nn.Module):
         Returns:
             dict of scalar metrics: wm losses, actor loss, critic loss, return stats
         """
+        # advance probe step counter (once per train_step)
+        if not hasattr(self, "_probe_step"): self._probe_step = 0
+        self._probe_step += 1
+        probes.set_step(self._probe_step)
         # sample a batch: batch = replay_buffer.sample(config['batch_size'])
         batch = replay_buffer.sample(self.config['batch_size'])
-        # update world model: wm_info, features = self.world_model.update(batch, wm_optimizer, device, grad_clip)
-        info, features = self.world_model.update(batch, self.wm_optimizer, self.device, self.config['grad_clip'])
+        # PROBES: batch stats
+        probes.probe("batch_obs", batch['obs'])
+        probes.probe("batch_reward", batch['reward'])
+        probes.probe("batch_action", batch['action'])
+        # update world model: OP-01 wm-specific clip
+        info, features = self.world_model.update(batch, self.wm_optimizer, self.device, self.wm_grad_clip)
         # generate imagined rollout from random subset of features:
         #   start_features = features.detach().reshape(-1, state_dim)  (flatten B*T)
         start_features = features.detach().reshape(-1, self.state_dim)
@@ -200,53 +218,75 @@ class DreamerV3(nn.Module):
         return {'wm_loss': wm_loss, **wm_info_prefixed, **ac_info}
 
     def compute_lambda_returns(self, rollout: dict) -> torch.Tensor:
-        """
-        Computes bootstrapped TD(lambda) returns from an imagined rollout.
-        Uses the CURRENT critic for bootstrap values (detached, no gradient).
+        """Back-compat alias: returns just the lambda-return target (B, H-1) after AC-03 slicing.
 
-        Matches DreamerV3 paper (p.6) and the official code default (`slowtar: False`
-        in imag_loss / repl_loss): "compute returns using the current critic network".
-        The EMA copy is used only as a regularization target inside update_actor_critic(),
-        never here.
+        The full contract with weights/base is exposed via compute_targets().
+        """
+        target, _, _, _ = self.compute_targets(rollout)
+        return target
+
+    def compute_targets(self, rollout: dict) -> tuple:
+        """
+        AC-03 / L-03 / CR-06: computes lambda-return targets, discount-cumprod weights,
+        and value baseline aligned with the reference implementation.
+
+        Reference slicing:
+            target  = lambda_return(reward[1:], value[:-1], discount[1:], bootstrap=value[-1])
+            weights = cumprod([1, discount[:-1]], dim=time)         # weight per step
+            base    = value[:-1]                                    # baseline for adv
+
+        Our batch-first shapes (B, H) → returns/weights/base shape (B, H-1).
+
+        Values are computed via the SLOW (EMA) critic, matching reference
+        (`self.value(imag_feat).mode()` where value = live critic in ref, but reference
+        also uses slow_value for critic distillation; we use live critic here for target,
+        slow critic for distillation — same as ref).
 
         Args:
-            rollout: dict with 'features' (B, H, state_dim), 'rewards' (B, H),
-                     'continues' (B, H) — from world_model.imagine_rollout()
+            rollout: dict from world_model.imagine_rollout()
+                     'features' (B, H, sd), 'rewards' (B, H), 'continues' (B, H)
         Returns:
-            returns: shape (B, H) — lambda-return targets R_t^lambda
-
-        Notes on shapes:
-            The lambda_return function needs values of shape (B, H+1):
-                v_0 .. v_{H-1}  from critic(features[:, 0..H-1]).mean()
-                v_H             from critic(features[:, H-1]).mean() as bootstrap
-                    (since we have H imagined steps, we use the last state's value as v_H)
-
-        IMPORTANT: wrap the critic call in torch.no_grad() OR call .detach() on the
-        values tensor. The bootstrap targets must not carry a gradient back into
-        the critic — otherwise the critic learns to make its own targets smaller
-        (a degenerate self-referential loss).
+            target:  (B, H-1) — lambda returns for imag steps 1..H-1
+            weights: (B, H)   — cumulative discount weights (full length; caller slices)
+            base:    (B, H-1) — value baseline for advantage (value at states 0..H-2)
+            values:  (B, H)   — critic mean over all H imag features (used for logging)
         """
-        # extract features, rewards, continues from rollout
-        features = rollout['features']  # shape (B, H, state_dim)
-        rewards = rollout['rewards']    # shape (B, H)
-        continues = rollout['continues']  # shape (B, H)
-        
-        # get value estimates at each step (no gradient — these are targets):
-        #   with torch.no_grad(): values_dist = self.critic(features)
+        features = rollout['features']       # (B, H, sd)
+        rewards = rollout['rewards']         # (B, H)
+        continues = rollout['continues']     # (B, H) in [0, 1]
+
+        # Value estimates over ALL H imagined features. Detach so bootstrap gradient
+        # doesn't leak into the critic. Critic itself is optimized separately below.
         with torch.no_grad():
-            values_dist = self.critic(features)  # shape (B, H)
-        # compute value mean: values = values_dist.mean()  shape (B, H)
-        values = values_dist.mean()  # shape (B, H) (mean of distribution so does not retunrn sclalar)
-        # compute bootstrap value: v_H = values[:, -1:]  shape (B, 1)
-        v_H = values[:, -1:]  # shape (B, 1) vakue at horizon step (last imagined state)
-        # concatenate to get all H+1 values: values_all = torch.cat([values, v_H], dim=1)  shape (B, H+1)
-        values_all = torch.cat([values, v_H], dim=1)  # shape (B, H+1)
-        # call lambda_return(rewards, values_all, continues, lambda_, discount)
-        returns = lambda_return(rewards, values_all, continues,
-                                 lambda_=self.config['lambda_return'], discount=self.config['discount'])
-        # return returns of shape (B, H)
-        return returns
-    
+            values = self.critic(features).mean()  # (B, H)
+
+        # Per-step discount = env discount * predicted continue prob.
+        discount = self.config['discount'] * continues  # (B, H)
+
+        # Lambda returns over H-1 steps.
+        # Our lambda_return signature: (rewards (B,T), values (B,T+1), continues (B,T), lambda_, discount_scalar).
+        # We fold cont into `continues` and pass discount=1.0 so per-step pcont = discount here.
+        rewards_used = rewards[:, 1:]                            # (B, H-1)
+        # values shape needed: (B, H) — v_1..v_{H-1} plus bootstrap v_H (= values[:, -1])
+        values_used = values                                     # (B, H): v_0..v_{H-1}; bootstrap taken as last.
+        # For lambda_return we need values of length H (rewards_used is H-1, values must be H-1+1).
+        # Pass values[:, 1:] (H-1) concat bootstrap values[:, -1:] (1) → (B, H). Actually values shape (B,H) works
+        # only if rewards has H-1 elements: recurrence reads values[:, t+1] for t=0..H-2 -> values[:,1..H-1]
+        # and bootstrap = values[:, -1] = values[:, H-1]. So values_used = values (B,H) is correct.
+        continues_used = continues[:, 1:] * self.config['discount']  # (B, H-1); fold discount in
+        # Use lambda_return with discount=1.0 since we've folded discount into continues_used.
+        target = lambda_return(rewards_used, values_used, continues_used,
+                               lambda_=self.config['lambda_return'], discount=1.0)  # (B, H-1)
+
+        # Discount-cumprod weights: matches ref torch.cumprod(cat([1, discount[:-1]]), 0)
+        ones = torch.ones_like(discount[:, :1])                  # (B, 1)
+        weights = torch.cumprod(torch.cat([ones, discount[:, :-1]], dim=1), dim=1).detach()  # (B, H)
+
+        # Baseline: value at states 0..H-2
+        base = values[:, :-1]                                    # (B, H-1)
+
+        return target, weights, base, values
+
     def update_actor_critic(self, rollout: dict) -> dict:
         """
         Updates actor and critic from an imagined rollout.
@@ -269,59 +309,93 @@ class DreamerV3(nn.Module):
         Returns:
             dict with 'actor_loss', 'critic_loss', 'mean_return', 'return_scale'
         """
-        # compute lambda returns: returns = self.compute_lambda_returns(rollout)   shape (B, H)
-        returns = self.compute_lambda_returns(rollout)  # shape (B, H)
+        # AC-01 / AC-02 / AC-03 / CR-06 rewrite.
+        features = rollout['features']       # (B, H, sd) — HAS actor grad through dynamics
+        actions_imag = rollout['actions']    # (B, H, ad)
+
+        # Compute targets, weights, and baseline (see compute_targets docstring).
+        target, weights, base, values_full = self.compute_targets(rollout)
+        # target: (B, H-1) — has grad through rewards -> actions -> actor (dynamics path)
+        # weights: (B, H) detached
+        # base: (B, H-1) detached
+        probes.probe("lambda_returns", target)
+        probes.probe("critic_values", values_full)
+
+        # --- return-normalized advantage (matches ref RewardEMA) ---
+        # Update normalizer on target (as ref does, on the target tensor pre-detach doesn't matter — RN uses percentiles).
+        self.return_normalizer.update(target.detach())
+        scale = self.return_normalizer.scale
+        adv = (target - base) / scale        # base is detached; target keeps grad
+        probes.probe("advantages", adv)
+        probes.probe("return_scale", float(scale))
+
+        # --- actor loss ---
+        imag_gradient = self.config.get('imag_gradient', 'dynamics')
+        # Actor entropy: recompute policy over ALL H features (matches ref that uses [:-1] later).
+        # actor sees detached features (matches ref `inp = imag_feat.detach()`).
+        policy = self.actor(features.detach())
+        entropy = policy.entropy()           # (B, H)
+        if imag_gradient == 'dynamics':
+            # Dynamics gradient: actor loss = -weights[:-1] * adv
+            actor_target = adv               # (B, H-1) — grad through rewards
+        elif imag_gradient == 'reinforce':
+            log_probs = policy.log_prob(actions_imag)  # (B, H)
+            actor_target = log_probs[:, :-1] * adv.detach()  # (B, H-1)
+        else:
+            raise ValueError(f"Unknown imag_gradient={imag_gradient}")
+
+        # AC-02: discount-cumprod weights applied to actor loss. Slice to H-1 to align with target.
+        w = weights[:, :-1]                  # (B, H-1)
+        eta = self.config['actor_entropy']
+        # Entropy sliced to H-1 to match (ref: entropy[:-1]).
+        actor_loss = -(w * (actor_target + eta * entropy[:, :-1])).mean()
+        probes.probe("entropy", entropy)
+        probes.probe("actor_loss", actor_loss)
+
         # --- critic update ---
-        # detach features for critic: feats = rollout['features'].detach()
-        feats = rollout['features'].detach()  # shape (B, H, state_dim)
-        # compute critic distribution: critic_dist = self.critic(feats)
-        critic_dist = self.critic(feats)  # shape (B, H, num_bins)
-        # critic loss: -critic_dist.log_prob(symlog(returns.detach())).mean()
-        critic_loss = -critic_dist.log_prob(symlog(returns.detach())).mean()
-        # add EMA regularization: distillation — critic.forward(feats).log_prob(symlog(critic.forward_ema(feats).mean().detach()))
-        # matches official DreamerV3 `slowreg * value.loss(sg(slowvalue.pred()))`
+        # Critic uses detached features for first H-1 states (ref: value_input[:-1].detach()).
+        feats_for_critic = features[:, :-1].detach()          # (B, H-1, sd)
+        critic_dist = self.critic(feats_for_critic)           # (B, H-1)
+        target_sg = target.detach()                            # (B, H-1)
+        critic_loss_per = -critic_dist.log_prob(symlog(target_sg))  # (B, H-1)
+        # Slow-target distillation (ref: value.log_prob(slow.mode().detach()))
         with torch.no_grad():
-            slow_target = self.critic.forward_ema(feats).mean()   # real-space scalar
-        critic_reg = -critic_dist.log_prob(symlog(slow_target)).mean()
-        critic_loss = critic_loss + self.config['critic_slowreg'] * critic_reg
+            slow_mode = self.critic.forward_ema(feats_for_critic).mean()  # real-space
+        critic_reg_per = -critic_dist.log_prob(symlog(slow_mode))
+        critic_loss_per = critic_loss_per + self.config['critic_slowreg'] * critic_reg_per
+        # CR-06: weighted by cumulative discount (ref: torch.mean(weights[:-1] * value_loss)).
+        critic_loss = (w * critic_loss_per).mean()
+        probes.probe("critic_loss", critic_loss)
 
+        # PROBE: canonical actor mean for PointMass
+        if self.obs_dim == 1:
+            with torch.no_grad():
+                canon_xs = torch.tensor([[-0.5], [0.0], [+0.5]], dtype=torch.float32, device=features.device)
+                s0 = self.world_model.rssm.initial_state(3)
+                pa = torch.zeros(3, self.action_dim, device=features.device)
+                emb = self.world_model.encode(canon_xs)
+                ns, _ = self.world_model.rssm.observe(emb, pa, s0)
+                cfeat = self.world_model.rssm.get_state_feature(ns)
+                cmean = self.actor(cfeat).mean.squeeze(-1)
+            probes.probe("canon_actor_mean", cmean)
 
-        # zero_grad → critic_loss.backward() → clip gradients → critic_optimizer.step()
-        self.critic_optimizer.zero_grad()
-        critic_loss.backward()
-        torch.nn.utils.clip_grad_norm_(self.critic.parameters(), self.config['grad_clip'])
-        self.critic_optimizer.step()
-
-        # --- actor update ---
-        with torch.no_grad():
-            values_baseline = self.critic(feats).mean()  # shape (B, H) — detached baseline for advantage
-        # update return normalizer: self.return_normalizer.update(returns)
-
-        advantages = returns - values_baseline  # compute advantage (detached)
-        self.return_normalizer.update(returns)
-        scale = self.return_normalizer.scale # get current return scale for logging
-        # normalize advantage by return-percentile scale (paper: sg(adv / max(1, S)))
-        advantages_norm = advantages / scale
-        # re-compute action log_probs from the rollout (features already detached from WM):
-        #   action_dist = self.actor(feats)
-        action_dist = self.actor(feats)  # shape (B, H, action_dim)
-        #   log_probs = action_dist.log_prob(rollout['actions'])     shape (B, H)
-        log_probs = action_dist.log_prob(rollout['actions'])  # shape (B, H)
-        #   entropy   = action_dist.entropy()                        shape (B, H)
-        entropy = action_dist.entropy()  # shape (B, H)
-
-        actor_loss = -(log_probs * advantages_norm.detach() + self.config['actor_entropy'] * entropy).mean()
-        # zero_grad → actor_loss.backward() → clip gradients → actor_optimizer.step()
+        # --- backward. Critic loss uses detached features/target, so its graph is disjoint from actor's. ---
         self.actor_optimizer.zero_grad()
         actor_loss.backward()
-        torch.nn.utils.clip_grad_norm_(self.actor.parameters(), self.config['grad_clip'])
+        actor_gn = torch.nn.utils.clip_grad_norm_(self.actor.parameters(), self.actor_grad_clip)
         self.actor_optimizer.step()
-        # compile and return info dict
+
+        self.critic_optimizer.zero_grad()
+        critic_loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.critic.parameters(), self.critic_grad_clip)
+        self.critic_optimizer.step()
+        probes.probe("actor_grad_norm", actor_gn)
+
         info = {
             'actor_loss': actor_loss.item(),
             'critic_loss': critic_loss.item(),
-            'mean_return': returns.mean().item(),
-            'return_scale': scale
+            'mean_return': target.mean().item(),
+            'return_scale': float(scale),
         }
         return info
 

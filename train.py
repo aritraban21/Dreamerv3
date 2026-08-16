@@ -27,6 +27,8 @@ import gymnasium as gym
 
 from dreamer.agent import DreamerV3
 from dreamer.replay_buffer import ReplayBuffer
+from dreamer.utils import probes
+import dreamer.envs  # noqa: F401  (side-effect: registers custom envs like PointMass1D-v0)
 
 
 def load_config(config_path: str, overrides: dict = None) -> dict:
@@ -110,8 +112,10 @@ def collect_random_episodes(
         # step environment
         next_obs, reward, terminated, truncated, _ = env.step(action)
         done = terminated or truncated
-        # add to replay buffer using the obs at which the action was taken
-        replay_buffer.add(obs, action, float(reward), done, is_first)
+        # buffer stores TERMINATED (not done). Truncation is not termination — the
+        # episode could have continued. This distinction matters for cont_pred:
+        # continues = 1 - terminated. Matches reference (obs['cont'] = 1 - is_terminal).
+        replay_buffer.add(obs, action, float(reward), terminated, is_first)
         obs = next_obs
         is_first = False
         if done:
@@ -190,6 +194,12 @@ def train(config: dict) -> None:
     np.random.seed(seed)
     device = torch.device(config.get('device', 'cpu'))
 
+    # PROBES: enable if PROBE_FILE env var is set
+    _probe_file = os.environ.get("PROBE_FILE")
+    if _probe_file:
+        probes.set_probe_file(_probe_file)
+        print(f"[probes] writing to {_probe_file}", flush=True)
+
     grad_per_env = config['train_ratio'] / (config['batch_size'] * config['batch_length'])
     print(f"[startup] env={config['env']}  device={device}  seed={seed}", flush=True)
     print(f"[startup] total_steps={config['total_steps']}  batch={config['batch_size']}x{config['batch_length']}"
@@ -214,6 +224,18 @@ def train(config: dict) -> None:
                             num_steps=config['prefill_steps'])
     print(f"[prefill] done. buffer size = {len(replay_buffer)}", flush=True)
 
+    # LP-01: pretrain phase — N WM+AC update steps on prefill data before env interaction.
+    pretrain_steps = config.get('pretrain', 0)
+    if pretrain_steps > 0 and len(replay_buffer) >= config['batch_size'] * config['batch_length']:
+        print(f"[pretrain] running {pretrain_steps} update steps on prefill data...", flush=True)
+        for _pt in range(pretrain_steps):
+            metrics = agent.train_step(replay_buffer)
+            if _pt % max(1, pretrain_steps // 10) == 0:
+                print(f"[pretrain {_pt}/{pretrain_steps}] wm={metrics.get('wm_loss', float('nan')):.3f} "
+                      f"actor={metrics.get('actor_loss', float('nan')):.3f} "
+                      f"critic={metrics.get('critic_loss', float('nan')):.3f}", flush=True)
+        print("[pretrain] done.", flush=True)
+
     obs, _ = train_env.reset(seed=seed)
     is_first = True
     state = None
@@ -227,8 +249,8 @@ def train(config: dict) -> None:
         #         next_obs, reward, terminated, truncated, _ = env.step(action)
         next_obs, reward, terminated, truncated, _ = train_env.step(action)
         done = terminated or truncated
-        #         replay_buffer.add(obs, action, float(reward), done, is_first)
-        replay_buffer.add(obs, action, float(reward), done, is_first)
+        # Store TERMINATED (not done). Truncation is not termination.
+        replay_buffer.add(obs, action, float(reward), terminated, is_first)
         #         obs = next_obs; is_first = False
         obs = next_obs
         is_first = False

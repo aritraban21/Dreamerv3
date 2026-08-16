@@ -33,37 +33,30 @@ class BlockGRU(nn.Module):
     """
     GRU cell for updating the deterministic state h_t.
 
-    Standard GRU implementation is fine for Part 1.
-    The "Block" structure (splitting h into N blocks with separate gating) can
-    be added as an extension in Part 2 for better gradient flow.
+    RS-05: LayerNorm-inside GRUCell matching reference (networks.py:GRUCell). This is the
+    DreamerV2/V3 stability trick — LayerNorm over the gate pre-activations before splitting
+    into reset/candidate/update, plus a learned update-gate bias of -1.
 
-    Input: concatenation of [prev_z_flat, action]   shape (B, stoch_flat + action_dim)
-    Output: updated h_t                              shape (B, deter_dim)
+    Input: projected pre-GRU features (via img_in_layers) shape (B, hidden_dim)
+    Output: updated h_t                                   shape (B, deter_dim)
     """
 
-    def __init__(self, input_dim: int, deter_dim: int):
-        """
-        Args:
-            input_dim: stoch_dim * stoch_classes + action_dim
-            deter_dim: dimensionality of the GRU hidden state h (4096 in paper, 512 in small config)
-        """
+    def __init__(self, input_dim: int, deter_dim: int, update_bias: float = -1.0):
         super().__init__()
-        # build a standard GRU cell: nn.GRUCell(input_dim, deter_dim)
-        self.gru_cell = nn.GRUCell(input_dim, deter_dim)
+        self._input_dim = input_dim
+        self._deter_dim = deter_dim
+        self._update_bias = update_bias
+        # ref: Linear(input+state, 3*deter, bias=False) → LayerNorm(3*deter)
+        self.linear = nn.Linear(input_dim + deter_dim, 3 * deter_dim, bias=False)
+        self.norm = nn.LayerNorm(3 * deter_dim, eps=1e-3)
 
     def forward(self, x: torch.Tensor, h: torch.Tensor) -> torch.Tensor:
-        """
-        One GRU step: updates h given x.
-
-        Args:
-            x: shape (B, input_dim)  — concatenated [z_prev_flat, action]
-            h: shape (B, deter_dim)  — previous deterministic state
-        Returns:
-            h_next: shape (B, deter_dim) — updated deterministic state
-        """
-        # call the GRU cell with x and h and return h_next
-        h_next = self.gru_cell(x,h)
-        return h_next
+        parts = self.norm(self.linear(torch.cat([x, h], dim=-1)))
+        reset, cand, update = torch.split(parts, [self._deter_dim] * 3, dim=-1)
+        reset = torch.sigmoid(reset)
+        cand = torch.tanh(reset * cand)
+        update = torch.sigmoid(update + self._update_bias)
+        return update * cand + (1 - update) * h
 
 
 class RSSM(nn.Module):
@@ -106,21 +99,28 @@ class RSSM(nn.Module):
         self.unimix = unimix
         # compute stoch_flat = stoch_dim * stoch_classes (size of flattened z_t)
         self.stoch_flat = self.stoch_dim * self.stoch_classes
-        # build gru: BlockGRU(input_dim=stoch_flat + action_dim, deter_dim=deter_dim)
-        self.gru = BlockGRU(input_dim= self.stoch_flat + self.action_dim, deter_dim=self.deter_dim)
+        # RS-01: pre-GRU projection matching reference (`_img_in_layers`).
+        # cat(z_flat, action) -> Linear(inp, hidden, bias=False) -> LayerNorm -> SiLU -> GRUCell(hidden -> deter)
+        self.img_in_layers = nn.Sequential(
+            nn.Linear(self.stoch_flat + self.action_dim, self.hidden_dim, bias=False),
+            nn.LayerNorm(self.hidden_dim, eps=1e-3),
+            nn.SiLU(),
+        )
+        # build gru: input is projected hidden_dim now, output is deter_dim
+        self.gru = BlockGRU(input_dim=self.hidden_dim, deter_dim=self.deter_dim)
         # build prior_net: MLP that maps deter_dim → stoch_flat
         #   structure: Linear(deter_dim, hidden_dim) → RMSNorm → SiLU → Linear(hidden_dim, stoch_flat)
         self.prior_net = nn.Sequential(
-            nn.Linear(self.deter_dim, self.hidden_dim, bias=False),
-            nn.RMSNorm(self.hidden_dim),
+            nn.Linear(self.deter_dim, self.hidden_dim, bias=True),
+            nn.LayerNorm(self.hidden_dim, eps=1e-3),
             nn.SiLU(),
             nn.Linear(self.hidden_dim, self.stoch_flat)
         )
         # build posterior_net: MLP that maps (deter_dim + embed_dim) → stoch_flat
         #   structure: Linear(deter_dim + embed_dim, hidden_dim) → RMSNorm → SiLU → Linear(hidden_dim, stoch_flat)
         self.posterior_net = nn.Sequential(
-            nn.Linear(self.deter_dim + self.embed_dim, self.hidden_dim, bias=False),
-            nn.RMSNorm(self.hidden_dim),
+            nn.Linear(self.deter_dim + self.embed_dim, self.hidden_dim, bias=True),
+            nn.LayerNorm(self.hidden_dim, eps=1e-3),
             nn.SiLU(),
             nn.Linear(self.hidden_dim, self.stoch_flat)
         )
@@ -181,6 +181,8 @@ class RSSM(nn.Module):
         z_flat = prev_state['z'].flatten(start_dim=-2)
         # concatenate z_flat and action as GRU input
         x_t = torch.cat([z_flat, action], dim=-1)
+        # RS-01: project through img_in_layers before GRU
+        x_t = self.img_in_layers(x_t)
         # compute h via self.gru(gru_input, prev_state['h'])
         h_t = self.gru(x_t, prev_state['h'])
         # compute posterior logits via self.posterior_net(cat(h, embed))
@@ -223,6 +225,8 @@ class RSSM(nn.Module):
         z_flat = prev_state['z'].flatten(start_dim=-2)
         # concatenate z_flat and action as GRU input
         x_t = torch.cat([z_flat, action], dim=-1)
+        # RS-01: project through img_in_layers before GRU
+        x_t = self.img_in_layers(x_t)
         # compute h via self.gru
         h_t = self.gru(x_t, prev_state['h'])
         # compute prior logits via self.prior_net(h)
@@ -288,9 +292,11 @@ class RSSM(nn.Module):
             h_t = torch.where(is_first_t, h_0, state['h'])
             #     reset z: state['z'] = torch.where(is_first_t.unsqueeze(-1), init_z, state['z'])
             z_t = torch.where(is_first_t.unsqueeze(-1), z_0, state['z'])
-            #     call state, dists = self.observe(embeds[:, t], actions[:, t], state)
+            #     RS-02: zero prev_action on is_first (matches ref: prev_action *= (1 - is_first))
+            action_t = actions[:, t] * (~is_first_t).float()
+            #     call state, dists = self.observe(embeds[:, t], action_t, state)
             state = {'h': h_t, 'z': z_t}
-            state, logits = self.observe(embeds[:, t], actions[:, t], state)
+            state, logits = self.observe(embeds[:, t], action_t, state)
             #     append get_state_feature(state) to features list
             features_list.append(self.get_state_feature(state))
             #     append dists['posterior_logits'] to posterior_logits list
@@ -336,16 +342,17 @@ class RSSM(nn.Module):
         features_list = []
         actions_list = []
         # loop over t in range(horizon):
-        for i in range(horizon):
-            #     compute feature = self.get_state_feature(state)
+        for _ in range(horizon):
+            # compute feature = self.get_state_feature(state)
             feature = self.get_state_feature(state)
-            #     sample action = actor.get_action(feature, training=True)
-            action = actor.get_action(feature, training=True)
+            # AC-01: actor sees detached feat (matches ref `inp = feat.detach()`), so its own
+            # gradient at step t doesn't flow back through prior actor parameters via the recurrence.
+            # Gradient still reaches earlier actor params via action -> dynamics -> next feat -> reward.
+            action = actor.get_action(feature.detach(), training=True)
             #     call state, _ = self.imagine(action, state)
             state, _ = self.imagine(action, state)
-            #     append feature to features list
+            # keep un-detached feature so reward_pred/cont_pred gradient flows to prior actor calls
             features_list.append(feature)
-            #     append action to actions list
             actions_list.append(action)
         # stack features along dim=1: torch.stack(features, dim=1)
         stacked_features = torch.stack(features_list, dim=1)

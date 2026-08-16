@@ -46,11 +46,11 @@ class MLPDecoder(nn.Module):
         """
         super().__init__()
         # build input projection: nn.Linear(state_dim, hidden_dim, bias=False)
-        self.input = nn.Linear(state_dim, hidden_dim, bias=False)
+        self.input = nn.Linear(state_dim, hidden_dim, bias=True)
         # build hidden layers as nn.ModuleList (same pattern as encoder)
         self.hidden = nn.ModuleList()
         for layer in range(num_layers):
-            self.hidden.append(nn.RMSNorm(hidden_dim))
+            self.hidden.append(nn.LayerNorm(hidden_dim, eps=1e-3))
             self.hidden.append(nn.SiLU())
             self.hidden.append(nn.Linear(hidden_dim, hidden_dim, bias=False))
         # build output projection: nn.Linear(hidden_dim, obs_dim, bias=False)
