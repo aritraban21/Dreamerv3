@@ -5,8 +5,11 @@ seed: 0
 device: cuda  # or cpu
 total_steps: 500000
 eval_every: 10000
-eval_episodes: 5
-save_path: checkpoints/dreamer.pt
+eval_episodes: 25            # 25-episode eval for stable best-checkpoint selection
+save_dir: checkpoints/{env}  # per-env dir; formatted with config['env'] at runtime
+video_dir: videos/{env}      # per-env video dir (used when --record-video is passed)
+log_dir: logs                # stdout tee-log dir
+imag_video_horizon: 200      # imagined-rollout length for imag_step_*.mp4
 log_every: 25
 
 # Replay buffer

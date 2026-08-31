@@ -1,0 +1,23 @@
+# InvertedPendulum-v4 — Mujoco balance task.
+# obs_dim=4 (cart_x, pole_angle, cart_vel, pole_angular_vel) == qpos + qvel identity
+# action_dim=1 (force on cart, in [-3, 3] — gets rescaled to [-1, 1] by RescaleAction wrapper)
+# Episode length 1000 (terminates on pole fall).
+# Requires `gymnasium[mujoco]` + `mujoco`.
+# Imagination-video IS supported here (see IMAG_VIDEO_HOOKS in dreamer/utils/video.py).
+
+env: InvertedPendulum-v4
+seed: 0
+device: cpu
+total_steps: 200000
+eval_every: 5000
+eval_episodes: 25
+imag_video_horizon: 200
+log_every: 25
+
+# Pendulum-sized model.
+embed_dim: 256
+deter_dim: 512
+stoch_dim: 16
+stoch_classes: 16
+hidden_dim: 256
+num_layers: 2

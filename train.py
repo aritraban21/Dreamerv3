@@ -20,6 +20,7 @@ See README.md for expected learning curves and common debugging tips.
 
 import argparse
 import os
+from datetime import datetime
 import yaml
 import numpy as np
 import torch
@@ -27,6 +28,7 @@ import gymnasium as gym
 
 from dreamer.agent import DreamerV3
 from dreamer.replay_buffer import ReplayBuffer
+from dreamer.utils.logging import tee_stdout
 import dreamer.envs  # noqa: F401  (side-effect: registers custom envs like PointMass1D-v0)
 
 
@@ -55,23 +57,19 @@ def load_config(config_path: str, overrides: dict = None) -> dict:
     return default_config
 
 
-def make_env(env_name: str, seed: int = 0) -> gym.Env:
+def make_env(env_name: str, seed: int = 0, render_mode: str = None) -> gym.Env:
     """
     Creates a gymnasium environment with the given seed.
     Wraps the action space to [-1, 1] using RescaleAction if the action space is not already bounded.
 
     Args:
-        env_name: gymnasium environment ID (e.g., 'Pendulum-v1', 'HalfCheetah-v4')
-        seed:     random seed for reproducibility
+        env_name:    gymnasium environment ID (e.g., 'Pendulum-v1', 'HalfCheetah-v4')
+        seed:        random seed for reproducibility
+        render_mode: passed through to gym.make (e.g., 'rgb_array' for video recording)
     Returns:
         env: wrapped gymnasium environment
-    Notes:
-        - For environments with action bounds other than [-1, 1],
-          wrap with gym.wrappers.RescaleAction(env, min_action=-1, max_action=1)
-        - Call env.reset(seed=seed) immediately after creation to set the seed
     """
-    # create environment: gym.make(env_name)
-    env = gym.make(env_name)
+    env = gym.make(env_name, render_mode=render_mode) if render_mode else gym.make(env_name)
     # wrap with RescaleAction if action space is continuous (Box) and not already [-1, 1]:
     #   env = gym.wrappers.RescaleAction(env, min_action=-1.0, max_action=1.0)
     if isinstance(env.action_space, gym.spaces.Box):
@@ -121,21 +119,14 @@ def collect_random_episodes(
             obs, _ = env.reset()
             is_first = True
 
-def evaluate(
+def evaluate_returns(
     agent: DreamerV3,
     env: gym.Env,
     num_episodes: int = 5,
-) -> float:
+) -> list:
     """
-    Evaluates the agent for a fixed number of episodes using greedy (mean) actions.
-    No exploration noise — action = actor.mean().
-
-    Args:
-        agent:        trained DreamerV3 agent
-        env:          gymnasium environment (can be the same env as training)
-        num_episodes: number of complete episodes to run
-    Returns:
-        mean_return: average undiscounted episodic return across episodes
+    Runs num_episodes greedy episodes and returns the list of per-episode returns.
+    Shared rollout loop between train-time eval and standalone evaluate.py.
     """
     agent.eval()
     returns = []
@@ -151,7 +142,16 @@ def evaluate(
                 break
         returns.append(episode_return)
     agent.train()
-    return float(np.mean(returns))
+    return returns
+
+
+def evaluate(
+    agent: DreamerV3,
+    env: gym.Env,
+    num_episodes: int = 5,
+) -> float:
+    """Mean-return wrapper around evaluate_returns() for train-time logging."""
+    return float(np.mean(evaluate_returns(agent, env, num_episodes)))
 
 
 def train(config: dict) -> None:
@@ -204,6 +204,22 @@ def train(config: dict) -> None:
     action_dim = train_env.action_space.shape[0]
     print(f"[startup] obs_dim={obs_dim}  action_dim={action_dim}", flush=True)
 
+    # Optional video env (rgb_array render). Only built when recording is on.
+    record_video = bool(config.get('record_video', False))
+    video_env = None
+    video_dir = None
+    if record_video:
+        from dreamer.utils.video import record_env_video, record_imag_video, IMAG_VIDEO_HOOKS  # noqa: F401
+        video_env = make_env(config['env'], seed=seed, render_mode='rgb_array')
+        video_dir = config.get('video_dir', 'videos/{env}').format(env=config['env'])
+        os.makedirs(video_dir, exist_ok=True)
+        print(f"[startup] video recording ON -> {video_dir}", flush=True)
+
+    # Per-env checkpoint dir.
+    ckpt_dir = config.get('save_dir', 'checkpoints/{env}').format(env=config['env'])
+    os.makedirs(ckpt_dir, exist_ok=True)
+    print(f"[startup] checkpoints -> {ckpt_dir}", flush=True)
+
     agent = DreamerV3(obs_dim, action_dim, config).to(device)
     n_params = sum(p.numel() for p in agent.parameters())
     print(f"[startup] agent params: {n_params/1e6:.2f}M", flush=True)
@@ -233,6 +249,7 @@ def train(config: dict) -> None:
     is_first = True
     state = None
     train_debt = 0.0
+    best_eval = -float('inf')
     print("[train] entering main loop.", flush=True)
     # main loop over global_step in range(config['total_steps']):
     for global_step in range(config['total_steps']):
@@ -269,15 +286,46 @@ def train(config: dict) -> None:
         # periodic evaluation + checkpoint
         if global_step > 0 and global_step % config['eval_every'] == 0:
             mean_return = evaluate(agent, eval_env, config['eval_episodes'])
-            print(f"[step {global_step}] eval return = {mean_return:.2f}", flush=True)
-            agent.save(config['save_path'])
+            print(f"[step {global_step}] eval return = {mean_return:.2f} "
+                  f"(episodes={config['eval_episodes']})", flush=True)
+            # Always save 'latest' for crash-resume; save 'best' + numbered history on new best.
+            agent.save(os.path.join(ckpt_dir, 'latest.pt'))
+            if mean_return > best_eval:
+                best_eval = mean_return
+                agent.save(os.path.join(ckpt_dir, 'best.pt'))
+                agent.save(os.path.join(ckpt_dir, f'best_step_{global_step}.pt'))
+                print(f"[ckpt] new best {mean_return:.2f} -> best.pt + best_step_{global_step}.pt", flush=True)
+            # Optional videos: one real-env rollout, one imagination rollout.
+            if record_video:
+                from dreamer.utils.video import record_env_video, record_imag_video, IMAG_VIDEO_HOOKS
+                env_path = os.path.join(video_dir, f'env_step_{global_step}.mp4')
+                imag_path = os.path.join(video_dir, f'imag_step_{global_step}.mp4')
+                start_state = record_env_video(agent, video_env, env_path,
+                                               seed=seed + global_step, env_name=config['env'])
+                print(f"[video] wrote {env_path}", flush=True)
+                if config['env'] in IMAG_VIDEO_HOOKS and start_state is not None:
+                    record_imag_video(agent, video_env, imag_path, start_state,
+                                      horizon=config.get('imag_video_horizon', 200),
+                                      env_name=config['env'], seed=seed + global_step)
+                    print(f"[video] wrote {imag_path}", flush=True)
+                else:
+                    print(f"[video] imagination video not implemented for {config['env']}, skipping",
+                          flush=True)
 
-    # final evaluation + save
+    # final evaluation + save (same three-way save as periodic)
     mean_return = evaluate(agent, eval_env, config['eval_episodes'])
     print(f"[final] eval return = {mean_return:.2f}", flush=True)
-    agent.save(config['save_path'])
+    agent.save(os.path.join(ckpt_dir, 'latest.pt'))
+    if mean_return > best_eval:
+        best_eval = mean_return
+        agent.save(os.path.join(ckpt_dir, 'best.pt'))
+        agent.save(os.path.join(ckpt_dir, f'best_step_final.pt'))
+        print(f"[ckpt] final is best {mean_return:.2f} -> best.pt + best_step_final.pt", flush=True)
+    print(f"[final] best eval seen = {best_eval:.2f}", flush=True)
     train_env.close()
     eval_env.close()
+    if video_env is not None:
+        video_env.close()
 
 
 def main():
@@ -295,20 +343,40 @@ def main():
                         help="Random seed override (overrides config['seed'])")
     parser.add_argument('--device', type=str, default=None, choices=['cpu', 'cuda'],
                         help="Device override (overrides config['device'])")
+    parser.add_argument('--record-video', action='store_true', dest='record_video',
+                        help="At every eval, record one real-env episode and one imagination episode (mp4).")
+    parser.add_argument('--total-steps', type=int, default=None, dest='total_steps',
+                        help="Override total_steps (useful for smokes).")
+    parser.add_argument('--eval-every', type=int, default=None, dest='eval_every',
+                        help="Override eval_every (useful for smokes).")
+    parser.add_argument('--eval-episodes', type=int, default=None, dest='eval_episodes',
+                        help="Override eval_episodes.")
     args = parser.parse_args()
 
-    # build overrides dict from any non-None CLI args
-    overrides = {k: v for k, v in vars(args).items()
-                 if k != 'config' and v is not None}
+    # build overrides dict from any non-None / non-False CLI args
+    overrides = {}
+    for k, v in vars(args).items():
+        if k == 'config':
+            continue
+        if v is None:
+            continue
+        if k == 'record_video' and not v:
+            continue
+        overrides[k] = v
 
     config = load_config(args.config, overrides)
 
-    # create save directory if needed
-    save_dir = os.path.dirname(config['save_path'])
-    if save_dir:
-        os.makedirs(save_dir, exist_ok=True)
+    # Tee stdout/stderr to a timestamped log file.
+    ts = datetime.now().strftime('%Y%m%d-%H%M%S')
+    log_dir = config.get('log_dir', 'logs')
+    log_path = os.path.join(log_dir, f"{config['env']}_{ts}.log")
+    log_file = tee_stdout(log_path)
+    print(f"[log] tee to {log_path}", flush=True)
 
-    train(config)
+    try:
+        train(config)
+    finally:
+        log_file.close()
 
 
 if __name__ == "__main__":

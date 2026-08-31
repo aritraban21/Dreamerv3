@@ -7,8 +7,8 @@ seed: 0
 device: cpu              # Pendulum is tiny; CPU is fine for Part 1
 total_steps: 200000
 eval_every: 5000
-eval_episodes: 5
-save_path: checkpoints/pendulum.pt
+eval_episodes: 25            # 25-episode eval for stable best-ckpt selection
+imag_video_horizon: 200      # Pendulum episode length
 log_every: 25
 
 # Smaller model for faster iteration in Part 1

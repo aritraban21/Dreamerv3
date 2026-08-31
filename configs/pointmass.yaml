@@ -1,0 +1,27 @@
+# Sanity-test config for PointMass1D. Kept close to default.yaml so probe
+# divergences are attributable to code differences, not hyperparameter drift.
+# Only overrides: env, small model, tight batch, short run, cpu.
+
+env: PointMass1D-v0
+seed: 0
+device: cpu
+total_steps: 5000
+eval_every: 500
+eval_episodes: 5             # keep small on toy env (25 would be overkill)
+imag_video_horizon: 20       # 20-step episodes on PointMass
+log_every: 100
+
+# Small model — env is 1D, no need for capacity.
+embed_dim: 64
+deter_dim: 128
+stoch_dim: 8
+stoch_classes: 8
+hidden_dim: 128
+num_layers: 2
+
+# Short sequences (episodes are 20 steps).
+batch_size: 16
+batch_length: 20
+imagination_horizon: 15
+prefill_steps: 400
+train_ratio: 128
