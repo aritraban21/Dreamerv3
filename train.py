@@ -32,6 +32,37 @@ from dreamer.utils.logging import tee_stdout
 import dreamer.envs  # noqa: F401  (side-effect: registers custom envs like PointMass1D-v0)
 
 
+def _wandb_init(config: dict, run_ts: str):
+    """Starts a WandB run if config['wandb'] is truthy. Returns the wandb module or None.
+
+    Requires WANDB_API_KEY to be set in the environment (never in code/config) —
+    wandb.init() reads it automatically. We check for it up front rather than letting
+    wandb.init() discover it's missing, because wandb falls back to an interactive
+    login prompt (which hangs forever with no stdin, e.g. under a training script).
+    Any other init failure (bad key, network) is also caught so it can't kill training.
+    """
+    if not config.get('wandb', False):
+        return None
+    if not os.environ.get('WANDB_API_KEY'):
+        print("[wandb] --wandb passed but WANDB_API_KEY is not set in the environment. "
+              "Continuing without wandb.", flush=True)
+        return None
+    import wandb
+    try:
+        wandb.init(
+            project=config.get('wandb_project', 'dreamerv3'),
+            entity=config.get('wandb_entity') or None,
+            name=f"{config['env']}_{run_ts}",
+            group=config['env'],
+            config=config,
+        )
+    except Exception as e:
+        print(f"[wandb] failed to start run ({e}). Is WANDB_API_KEY set? Continuing without wandb.",
+              flush=True)
+        return None
+    return wandb
+
+
 def load_config(config_path: str, overrides: dict = None) -> dict:
     """
     Loads a yaml config file, then merges in any CLI overrides.
@@ -154,7 +185,7 @@ def evaluate(
     return float(np.mean(evaluate_returns(agent, env, num_episodes)))
 
 
-def train(config: dict) -> None:
+def train(config: dict, run_ts: str = None) -> None:
     """
     Main DreamerV3 training loop.
 
@@ -192,6 +223,11 @@ def train(config: dict) -> None:
     torch.manual_seed(seed)
     np.random.seed(seed)
     device = torch.device(config.get('device', 'cpu'))
+
+    if run_ts is None:
+        run_ts = datetime.now().strftime('%Y%m%d-%H%M%S')
+    wandb = _wandb_init(config, run_ts)
+    verbose = bool(config.get('verbose', False))
 
     grad_per_env = config['train_ratio'] / (config['batch_size'] * config['batch_length'])
     print(f"[startup] env={config['env']}  device={device}  seed={seed}", flush=True)
@@ -283,11 +319,31 @@ def train(config: dict) -> None:
             print(f"[step {global_step}] wm_loss={metrics.get('wm_loss', float('nan')):.3f}  "
                   f"actor_loss={metrics.get('actor_loss', float('nan')):.3f}  "
                   f"critic_loss={metrics.get('critic_loss', float('nan')):.3f}", flush=True)
+            if verbose:
+                print(f"[step {global_step}] wm/recon={metrics.get('wm/recon_loss', float('nan')):.4f} "
+                      f"wm/reward={metrics.get('wm/reward_loss', float('nan')):.4f} "
+                      f"wm/cont={metrics.get('wm/cont_loss', float('nan')):.4f} "
+                      f"wm/kl_dyn={metrics.get('wm/kl_dyn', float('nan')):.4f} "
+                      f"wm/kl_rep={metrics.get('wm/kl_rep', float('nan')):.4f} "
+                      f"wm/kl_dyn_raw={metrics.get('wm/kl_dyn_raw', float('nan')):.4f} "
+                      f"wm/kl_rep_raw={metrics.get('wm/kl_rep_raw', float('nan')):.4f} "
+                      f"wm_grad={metrics.get('wm_grad_norm', float('nan')):.2f} "
+                      f"actor_grad={metrics.get('actor_grad_norm', float('nan')):.2f} "
+                      f"critic_grad={metrics.get('critic_grad_norm', float('nan')):.2f} "
+                      f"policy_entropy={metrics.get('policy_entropy', float('nan')):.3f} "
+                      f"mean_return={metrics.get('mean_return', float('nan')):.2f} "
+                      f"return_scale={metrics.get('return_scale', float('nan')):.2f} "
+                      f"buffer={len(replay_buffer)} train_debt={train_debt:.2f}", flush=True)
+            if wandb is not None:
+                wandb.log(metrics, step=global_step)
         # periodic evaluation + checkpoint
         if global_step > 0 and global_step % config['eval_every'] == 0:
             mean_return = evaluate(agent, eval_env, config['eval_episodes'])
             print(f"[step {global_step}] eval return = {mean_return:.2f} "
                   f"(episodes={config['eval_episodes']})", flush=True)
+            if wandb is not None:
+                wandb.log({'eval/mean_return': mean_return, 'eval/best_eval': max(best_eval, mean_return)},
+                          step=global_step)
             # Always save 'latest' for crash-resume; save 'best' + numbered history on new best.
             agent.save(os.path.join(ckpt_dir, 'latest.pt'))
             if mean_return > best_eval:
@@ -326,6 +382,8 @@ def train(config: dict) -> None:
     eval_env.close()
     if video_env is not None:
         video_env.close()
+    if wandb is not None:
+        wandb.finish()
 
 
 def main():
@@ -351,6 +409,10 @@ def main():
                         help="Override eval_every (useful for smokes).")
     parser.add_argument('--eval-episodes', type=int, default=None, dest='eval_episodes',
                         help="Override eval_episodes.")
+    parser.add_argument('--wandb', action='store_true',
+                        help="Log metrics to Weights & Biases. Requires WANDB_API_KEY env var to be set.")
+    parser.add_argument('--verbose', action='store_true',
+                        help="Print extra per-step diagnostics (wm sub-losses, grad norms, policy entropy, etc.).")
     args = parser.parse_args()
 
     # build overrides dict from any non-None / non-False CLI args
@@ -360,7 +422,7 @@ def main():
             continue
         if v is None:
             continue
-        if k == 'record_video' and not v:
+        if k in ('record_video', 'wandb', 'verbose') and not v:
             continue
         overrides[k] = v
 
@@ -374,7 +436,7 @@ def main():
     print(f"[log] tee to {log_path}", flush=True)
 
     try:
-        train(config)
+        train(config, run_ts=ts)
     finally:
         log_file.close()
 

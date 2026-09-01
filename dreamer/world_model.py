@@ -171,6 +171,8 @@ class WorldModel(nn.Module):
         kl_dyn_raw = sg_posterior.kl_divergence(prior)
         # sum over stoch_dim: kl_dyn_raw = kl_dyn_raw.sum(-1)  shape (B, T)
         kl_dyn_raw = kl_dyn_raw.sum(-1)
+        # pre-free-bits mean, for diagnosing posterior collapse vs. genuine floor
+        kl_dyn_raw_mean = kl_dyn_raw.mean()
         # apply free bits: kl_dyn = torch.clamp(kl_dyn_raw, min=self.free_bits).mean()
         kl_dyn = torch.clamp(kl_dyn_raw, min=self.free_bits).mean()
         # --- representation loss: posterior || sg(prior) ---
@@ -179,13 +181,19 @@ class WorldModel(nn.Module):
         # compute KL: kl_rep_raw = posterior.kl_divergence(sg_prior)  shape (B, T, stoch_dim)
         kl_rep_raw = posterior.kl_divergence(sg_prior)
         # sum over stoch_dim and apply free bits: kl_rep = torch.clamp(...).mean()
-        kl_rep = kl_rep_raw.sum(-1)
-        kl_rep = torch.clamp(kl_rep, min=self.free_bits).mean()
+        kl_rep_raw = kl_rep_raw.sum(-1)
+        kl_rep_raw_mean = kl_rep_raw.mean()
+        kl_rep = torch.clamp(kl_rep_raw, min=self.free_bits).mean()
         # --- combine ---
         # kl_loss = self.lambda_dyn * kl_dyn + self.lambda_rep * kl_rep
         kl_loss = self.lambda_dyn * kl_dyn + self.lambda_rep * kl_rep
         # return kl_loss, {'kl_dyn': kl_dyn.item(), 'kl_rep': kl_rep.item()}
-        return kl_loss, {'kl_dyn': kl_dyn.item(), 'kl_rep': kl_rep.item()}
+        return kl_loss, {
+            'kl_dyn': kl_dyn.item(),
+            'kl_rep': kl_rep.item(),
+            'kl_dyn_raw': kl_dyn_raw_mean.item(),
+            'kl_rep_raw': kl_rep_raw_mean.item(),
+        }
 
     def compute_loss(
         self,
@@ -279,9 +287,10 @@ class WorldModel(nn.Module):
         # loss.backward()
         loss.backward()
         # clip gradients by global norm: nn.utils.clip_grad_norm_(self.parameters(), grad_clip)
-        nn.utils.clip_grad_norm_(self.parameters(), grad_clip)
+        wm_grad_norm = nn.utils.clip_grad_norm_(self.parameters(), grad_clip)
         # optimizer.step()
         optimizer.step()
+        info['wm_grad_norm'] = float(wm_grad_norm)
         # re-run observe_sequence (no_grad) to get features for actor-critic seeding
         with torch.no_grad():
             features, _, _ = self.observe_sequence(obs, actions, is_first)

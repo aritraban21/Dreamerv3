@@ -12,6 +12,11 @@ log_dir: logs                # stdout tee-log dir
 imag_video_horizon: 200      # imagined-rollout length for imag_step_*.mp4
 log_every: 25
 
+# Weights & Biases (used only when --wandb is passed). API key must be set via the
+# WANDB_API_KEY env var — never here or anywhere else in the repo.
+wandb_project: dreamerv3
+wandb_entity: null           # null = use the API key's default entity
+
 # Replay buffer
 replay_capacity: 5000000   # paper Table 4: 5e6. Memory-heavy; 1e6 is fine for Pendulum/state-based obs.
 prefill_steps: 1000        # random steps before first gradient update

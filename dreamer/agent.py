@@ -204,9 +204,10 @@ class DreamerV3(nn.Module):
         # update EMA: self.critic.update_ema()
         self.critic.update_ema()
         # merge info dicts and return
+        wm_grad_norm = info.pop('wm_grad_norm', float('nan'))
         wm_info_prefixed = {f'wm/{k}': v for k, v in info.items()}
         wm_loss = info['recon_loss'] + info['reward_loss'] + info['cont_loss'] + info['kl_dyn'] + info['kl_rep']
-        return {'wm_loss': wm_loss, **wm_info_prefixed, **ac_info}
+        return {'wm_loss': wm_loss, 'wm_grad_norm': wm_grad_norm, **wm_info_prefixed, **ac_info}
 
     def compute_lambda_returns(self, rollout: dict) -> torch.Tensor:
         """Back-compat alias: returns just the lambda-return target (B, H-1) after AC-03 slicing.
@@ -354,12 +355,12 @@ class DreamerV3(nn.Module):
         # --- backward. Critic loss uses detached features/target, so its graph is disjoint from actor's. ---
         self.actor_optimizer.zero_grad()
         actor_loss.backward()
-        torch.nn.utils.clip_grad_norm_(self.actor.parameters(), self.actor_grad_clip)
+        actor_grad_norm = torch.nn.utils.clip_grad_norm_(self.actor.parameters(), self.actor_grad_clip)
         self.actor_optimizer.step()
 
         self.critic_optimizer.zero_grad()
         critic_loss.backward()
-        torch.nn.utils.clip_grad_norm_(self.critic.parameters(), self.critic_grad_clip)
+        critic_grad_norm = torch.nn.utils.clip_grad_norm_(self.critic.parameters(), self.critic_grad_clip)
         self.critic_optimizer.step()
 
         info = {
@@ -367,6 +368,9 @@ class DreamerV3(nn.Module):
             'critic_loss': critic_loss.item(),
             'mean_return': target.mean().item(),
             'return_scale': float(scale),
+            'actor_grad_norm': float(actor_grad_norm),
+            'critic_grad_norm': float(critic_grad_norm),
+            'policy_entropy': entropy[:, :-1].mean().item(),
         }
         return info
 
