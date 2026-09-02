@@ -363,6 +363,10 @@ class DreamerV3(nn.Module):
         critic_grad_norm = torch.nn.utils.clip_grad_norm_(self.critic.parameters(), self.critic_grad_clip)
         self.critic_optimizer.step()
 
+        # --- diagnostics for the return-scale runaway / collapse hypothesis (all detached) ---
+        with torch.no_grad():
+            target_flat = target.detach().flatten()
+            imag_rewards = rollout['rewards'].detach()   # (B, H) expected per-step reward
         info = {
             'actor_loss': actor_loss.item(),
             'critic_loss': critic_loss.item(),
@@ -371,6 +375,20 @@ class DreamerV3(nn.Module):
             'actor_grad_norm': float(actor_grad_norm),
             'critic_grad_norm': float(critic_grad_norm),
             'policy_entropy': entropy[:, :-1].mean().item(),
+            # H1: critic value magnitude/spread — does the critic explode?
+            'value_mean': values_full.mean().item(),
+            'value_std': values_full.std().item(),
+            # which tail spreads the normalizer range + raw (pre-clamp) EMA range
+            'target_p05': torch.quantile(target_flat, 0.05).item(),
+            'target_p95': torch.quantile(target_flat, 0.95).item(),
+            'ret_ema_range_raw': self.return_normalizer.ema_range_raw,
+            # H2: is the actor signal vanishing as scale grows?
+            'adv_abs_mean': adv.detach().abs().mean().item(),
+            # H3: reward head drifting below the physical floor (Pendulum min ~= -16.3/step)?
+            'imag_reward_mean': imag_rewards.mean().item(),
+            'imag_reward_min': imag_rewards.min().item(),
+            # policy saturating to +-absmax (bang-bang / collapsed)?
+            'action_abs_mean': actions_imag.detach().abs().mean().item(),
         }
         return info
 

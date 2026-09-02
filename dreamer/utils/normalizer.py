@@ -99,3 +99,10 @@ class ReturnNormalizer:
         """Current normalization denominator (after min_scale clamp). For logging."""
         # return max(self.min_scale, self._ema_range)
         return max(self.min_scale, float(self._ema_range))
+
+    @property
+    def ema_range_raw(self) -> float:
+        """Raw EMA inter-percentile range BEFORE the min_scale clamp. Diagnostic only:
+        lets us tell a genuinely growing return spread (this climbs) apart from a
+        clamp/stuck-EMA artifact (this would sit at/below min_scale)."""
+        return float(self._ema_range)
