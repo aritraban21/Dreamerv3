@@ -1,0 +1,8 @@
+# Benchmark run artifacts — never commit these
+logdir/
+videos/
+run.log
+*.mp4
+.venv*/
+__pycache__/
+*.pyc

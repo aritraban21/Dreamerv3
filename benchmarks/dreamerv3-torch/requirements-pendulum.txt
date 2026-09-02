@@ -1,0 +1,14 @@
+# Lean dependency set for the STATE-BASED Pendulum-v1 benchmark only.
+# (The full requirements.txt pulls mujoco/dm_control/crafter/memory_maze, none of
+#  which are needed here — Pendulum uses the MLP encoder/decoder, no image envs.)
+#
+# torch is intentionally omitted: on Colab it is preinstalled. Locally, install a
+# torch build for your platform separately.
+numpy==1.23.5           # gym 0.22 needs numpy<2; also avoids np.bool8 removal errors
+gym==0.22.0             # classic-control Pendulum-v1 (old 4-tuple API the ref uses)
+pygame                  # gym 0.22 classic_control imports pygame at module load
+ruamel.yaml==0.17.4     # dreamer.py config loader
+tensorboard             # metrics/scalar logging (eval_return -> metrics.jsonl)
+imageio                 # parity video writing (env_step_*.mp4 / imag_step_*.mp4)
+imageio-ffmpeg          # mp4 encoder backend for imageio
+matplotlib              # renders the pendulum frames (Agg backend, headless-safe)
