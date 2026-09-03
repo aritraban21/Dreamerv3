@@ -334,15 +334,6 @@ def train(config: dict, run_ts: str = None) -> None:
                       f"mean_return={metrics.get('mean_return', float('nan')):.2f} "
                       f"return_scale={metrics.get('return_scale', float('nan')):.2f} "
                       f"buffer={len(replay_buffer)} train_debt={train_debt:.2f}", flush=True)
-                print(f"[step {global_step}] value_mean={metrics.get('value_mean', float('nan')):.2f} "
-                      f"value_std={metrics.get('value_std', float('nan')):.2f} "
-                      f"target_p05={metrics.get('target_p05', float('nan')):.2f} "
-                      f"target_p95={metrics.get('target_p95', float('nan')):.2f} "
-                      f"ret_ema_range_raw={metrics.get('ret_ema_range_raw', float('nan')):.2f} "
-                      f"adv_abs_mean={metrics.get('adv_abs_mean', float('nan')):.4f} "
-                      f"imag_reward_mean={metrics.get('imag_reward_mean', float('nan')):.3f} "
-                      f"imag_reward_min={metrics.get('imag_reward_min', float('nan')):.3f} "
-                      f"action_abs_mean={metrics.get('action_abs_mean', float('nan')):.3f}", flush=True)
             if wandb is not None:
                 wandb.log(metrics, step=global_step)
         # periodic evaluation + checkpoint
