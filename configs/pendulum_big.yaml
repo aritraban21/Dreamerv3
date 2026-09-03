@@ -1,0 +1,31 @@
+# Part 1 — Pendulum-v1, LARGE model (paper-ish capacity, same size as default.yaml)
+#
+# Same as configs/pendulum.yaml but WITHOUT the size-shrinking overrides, i.e. full
+# default.yaml model dims (embed=1024, deter=4096, stoch=32x32, hidden=1024, ~100M
+# params). Used to test whether our training instability on Pendulum is caused by
+# the small model (configs/pendulum.yaml: deter=512, stoch=16x16, ~4M params) or is
+# a bug independent of model size — the reference DreamerV3-torch benchmark (see
+# benchmarks/ on the `benchmark` git branch) was stable at this large size and is
+# ALSO being tested at our small size (pendulum_small) for the matched comparison.
+#
+# obs_dim=3, action_dim=1, continuous, bounded rewards [-16, 0]
+
+env: Pendulum-v1
+seed: 0
+device: cuda              # large model — use GPU (Colab)
+total_steps: 200000
+eval_every: 5000
+eval_episodes: 25            # 25-episode eval for stable best-ckpt selection
+imag_video_horizon: 200      # Pendulum episode length
+log_every: 25
+
+# Full-size model — inherited as-is from default.yaml (no overrides needed):
+#   embed_dim: 1024
+#   deter_dim: 4096
+#   stoch_dim: 32
+#   stoch_classes: 32
+#   hidden_dim: 1024
+#   num_layers: 2
+
+# Keep all other hyperparameters at their default values
+# (inherit from default.yaml by loading default first, then overriding)
