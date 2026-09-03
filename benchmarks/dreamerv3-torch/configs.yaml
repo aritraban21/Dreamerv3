@@ -129,13 +129,42 @@ pointmass:
   time_limit: 20
   prefill: 400
 
+pendulum_small:
+  # TRUE apples-to-apples with our actual Pendulum runs: sizes matched to
+  # configs/pendulum.yaml (embed_dim=256, deter_dim=512, stoch=16x16, hidden=256).
+  # This is the decisive control: if the reference is STABLE at this size while our
+  # code diverges, the divergence is a bug in our code (not capacity/hyperparams).
+  task: pendulum_pendulum
+  device: cuda:0
+  steps: 200000
+  action_repeat: 1
+  envs: 1
+  train_ratio: 512
+  video_pred_log: false
+  encoder: {mlp_keys: 'state', cnn_keys: '$^', mlp_layers: 2, mlp_units: 256}
+  decoder: {mlp_keys: 'state', cnn_keys: '$^', mlp_layers: 2, mlp_units: 256}
+  batch_size: 16
+  batch_length: 64
+  imag_horizon: 16
+  dyn_hidden: 256                  # ours hidden_dim
+  dyn_deter: 512                   # ours deter_dim
+  dyn_stoch: 16                    # ours stoch_dim
+  dyn_discrete: 16                 # ours stoch_classes
+  units: 256                       # ours hidden_dim (MLP width for heads/actor/critic)
+  eval_every: 5000
+  eval_episode_num: 25
+  log_every: 1000
+  time_limit: 200
+  prefill: 1000
+  video_dir: 'videos/pendulum_small'
+  imag_video_horizon: 200
+
 pendulum:
-  # Reference DreamerV3 on Pendulum-v1, state-based obs, hyperparameters matched to
-  # our implementation (configs/pendulum.yaml + configs/default.yaml). The reference's
-  # OWN defaults already match ours for: dyn_stoch/dyn_discrete=32, actor entropy=3e-4,
-  # actor/critic lr=3e-5, model_lr=1e-4, grad_clip=1000, dyn_scale=0.5, rep_scale=0.1,
-  # kl_free=1.0, discount=0.997, discount_lambda=0.95, batch=16x64, train_ratio=512,
-  # pretrain=100, unimix=0.01. We only override the model SIZES and env settings below.
+  # Reference DreamerV3 on Pendulum-v1 at LARGE (paper-ish) capacity: sizes matched to
+  # configs/default.yaml (dyn_deter=4096, stoch=32x32, units=1024). NOTE: this is BIGGER
+  # than our actual Pendulum runs, which used the configs/pendulum.yaml overrides above.
+  # Kept as a high-capacity reference point (this run reached ~-145 and held stable).
+  # For the true apples-to-apples control against our runs, use `pendulum_small`.
   task: pendulum_pendulum          # suite=pendulum -> envs/pendulum.py
   device: cuda:0
   steps: 200000
